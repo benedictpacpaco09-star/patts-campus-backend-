@@ -137,29 +137,54 @@ class TopUpRequest(BaseModel):
 
 @app.post("/api/topup")
 def sync_kiosk_topup(req: TopUpRequest):
-    """Updates or sets the absolute final balance from the physical Kiosk cash terminal."""
+    """
+    Overwrites the cloud database balance with the new cash value compiled 
+    by the offline hardware bill validator terminal and logs a transaction entry.
+    """
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
-            # First, verify if the user account row exists in Supabase
-            cur.execute("SELECT balance FROM students WHERE uid = %s;", (req.uid,))
+            # 1. Fetch current details to compute the difference (amount added)
+            cur.execute("SELECT student_id, balance FROM students WHERE uid = %s;", (req.uid,))
             user = cur.fetchone()
             
             if not user:
                 conn.close()
-                return {"success": False, "message": "Student card not found on cloud infrastructure"}
+                return {"success": False, "message": "Student card profile not registered on network"}
             
-            # Directly overwrite the old cloud balance with the new cash validated balance
+            old_balance = float(user['balance'])
+            amount_added = req.new_balance - old_balance
+            student_id = user['student_id']
+            
+            # If the user re-taps a card without inserting new bills, don't flood the logs
+            if amount_added <= 0:
+                conn.close()
+                return {"success": True, "message": "Balance unchanged or matches cloud data. No log created."}
+
+            # 2. Execute database balance modification update execution
             cur.execute(
                 "UPDATE students SET balance = %s WHERE uid = %s;",
                 (req.new_balance, req.uid)
             )
+            
+            # 3. 📝 INSERT THE TRANSACTION LOG ENTRY
+            # (Adjust column names like 'student_id', 'amount', 'type', 'reference' to match your exact logs table structure)
+            cur.execute(
+                """
+                INSERT INTO transactions (student_id, amount, transaction_type, reference_device, current_balance) 
+                VALUES (%s, %s, %s, %s, %s);
+                """,
+                (student_id, amount_added, 'TOPUP', 'KIOSK_TERMINAL', req.new_balance)
+            )
+            
             conn.commit()
             
         conn.close()
         return {
-          "success": True, 
-          "message": f"Cloud balance synced perfectly to PHP {req.new_balance}"
+            "success": True, 
+            "message": f"Cloud balance updated smoothly to PHP {req.new_balance} and logged successfully."
         }
     except Exception as e:
+        if conn:
+            conn.close()
         return {"success": False, "error_details": str(e)}
