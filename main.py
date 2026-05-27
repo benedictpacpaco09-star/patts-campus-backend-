@@ -128,6 +128,8 @@ def test_database_connection():
             "error_details": str(e)
         }
 
+from datetime import datetime
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 # Schema matching your network coprocessor parameters
@@ -141,54 +143,43 @@ def sync_kiosk_topup(req: TopUpRequest):
     Overwrites the cloud database balance with the new cash value compiled 
     by the offline hardware bill validator terminal and logs a transaction entry.
     """
+    conn = get_db_connection()
     try:
-        conn = get_db_connection()
         with conn.cursor() as cur:
-            # 1. 🔍 Fetch using your correct column name: student_no
-            cur.execute("SELECT student_no, balance FROM students WHERE uid = %s;", (req.uid,))
-            user = cur.fetchone()
+            # 1. Fetch current metrics with row locking to ensure thread safety
+            cur.execute("SELECT balance, name FROM students WHERE uid = %s FOR UPDATE", (req.uid,))
+            student = cur.fetchone()
             
-            if not user:
-                conn.close()
-                return {"success": False, "message": "Student card profile not registered on network"}
+            if not student:
+                raise HTTPException(status_code=404, detail="Student record missing.")
             
-            old_balance = float(user['balance'])
+            old_balance = float(student["balance"])
             amount_added = req.new_balance - old_balance
-            student_no = user['student_no'] # Adjusted to match your schema
             
-            # Prevent logging identical re-taps if no cash was added
+            # Prevent logging identical taps if no new cash bills were inserted
             if amount_added <= 0:
-                conn.close()
-                return {"success": True, "message": "Balance unchanged. No log created."}
+                return {"success": True, "message": "Balance matches cloud data or is lower. No log created."}
 
-            # 2. 💰 Update the student's balance profile
-            cur.execute(
-                "UPDATE students SET balance = %s WHERE uid = %s;",
-                (req.new_balance, req.uid)
-            )
+            # 2. Directly update the student's cloud profile with the cash total
+            cur.execute("UPDATE students SET balance = %s WHERE uid = %s", (req.new_balance, req.uid))
             
-            # 3. 📝 Insert into logs using student_no
-            # NOTE: Double check your 'transactions' table to see if that column 
-            # is also named student_no or student_id, and adjust below if needed!
-            cur.execute(
-                """
-                INSERT INTO transactions (student_no, amount, transaction_type, reference_device, current_balance) 
-                VALUES (%s, %s, %s, %s, %s);
-                """,
-                (student_no, amount_added, 'TOPUP', 'KIOSK_TERMINAL', req.new_balance)
-            )
+            # 3. 📝 Insert the receipt entry into your 'logs' table matching your exact schema
+            timestamp = datetime.now()
+            cur.execute('''
+                INSERT INTO logs (uid, timestamp, type, amount, running_balance, device_id)
+                VALUES (%s, %s, 'TOPUP', %s, %s, 'KIOSK_TERMINAL')
+            ''', (req.uid, timestamp, amount_added, req.new_balance))
             
-            conn.commit()
+            conn.commit() # Safely commit changes
+            return {
+                "success": True, 
+                "name": student["name"], 
+                "new_balance": req.new_balance,
+                "message": f"Successfully topped up PHP {amount_added:.2f}"
+            }
             
-        conn.close()
-        return {
-            "success": True, 
-            "message": f"Cloud balance updated smoothly to PHP {req.new_balance} and logged successfully."
-        }
     except Exception as e:
-        # Safeguard close to prevent thread dangling on errors
-        try:
-            conn.close()
-        except:
-            pass
-        return {"success": False, "error_details": str(e)}
+        conn.rollback() # Undo database query blocks cleanly if network drops
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close() # Release connection slots back to Supabase pool
