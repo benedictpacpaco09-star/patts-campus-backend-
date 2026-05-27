@@ -127,3 +127,39 @@ def test_database_connection():
             "message": "Connection attempt broke.",
             "error_details": str(e)
         }
+
+from pydantic import BaseModel
+
+# Schema matching your network coprocessor parameters
+class TopUpRequest(BaseModel):
+    uid: str
+    new_balance: float
+
+@app.post("/api/topup")
+def sync_kiosk_topup(req: TopUpRequest):
+    """Updates or sets the absolute final balance from the physical Kiosk cash terminal."""
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            # First, verify if the user account row exists in Supabase
+            cur.execute("SELECT balance FROM students WHERE uid = %s;", (req.uid,))
+            user = cur.fetchone()
+            
+            if not user:
+                conn.close()
+                return {"success": False, "message": "Student card not found on cloud infrastructure"}
+            
+            # Directly overwrite the old cloud balance with the new cash validated balance
+            cur.execute(
+                "UPDATE students SET balance = %s WHERE uid = %s;",
+                (req.new_balance, req.uid)
+            )
+            conn.commit()
+            
+        conn.close()
+        return {
+          "success": True, 
+          "message": f"Cloud balance synced perfectly to PHP {req.new_balance}"
+        }
+    except Exception as e:
+        return {"success": False, "error_details": str(e)}
