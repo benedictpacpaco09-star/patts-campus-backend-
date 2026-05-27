@@ -105,3 +105,25 @@ def deduct_funds(req: TransactionRequest):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close() # CRUCIAL: Release the connection pool slot
+
+@app.get("/api/test-db")
+def test_database_connection():
+    """Diagnostic route to test if Vercel can talk to Supabase."""
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            # Run a raw, ultra-fast test query to confirm handshake
+            cur.execute("SELECT NOW();")
+            db_time = cur.fetchone()
+        conn.close()
+        return {
+            "status": "SUCCESS",
+            "message": "Vercel and Supabase are perfectly wired together!",
+            "database_time": str(db_time)
+        }
+    except Exception as e:
+        return {
+            "status": "FAILED",
+            "message": "Connection attempt broke.",
+            "error_details": str(e)
+        }
