@@ -144,8 +144,8 @@ def sync_kiosk_topup(req: TopUpRequest):
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
-            # 1. Fetch current details to compute the difference (amount added)
-            cur.execute("SELECT student_id, balance FROM students WHERE uid = %s;", (req.uid,))
+            # 1. 🔍 Fetch using your correct column name: student_no
+            cur.execute("SELECT student_no, balance FROM students WHERE uid = %s;", (req.uid,))
             user = cur.fetchone()
             
             if not user:
@@ -154,27 +154,28 @@ def sync_kiosk_topup(req: TopUpRequest):
             
             old_balance = float(user['balance'])
             amount_added = req.new_balance - old_balance
-            student_id = user['student_id']
+            student_no = user['student_no'] # Adjusted to match your schema
             
-            # If the user re-taps a card without inserting new bills, don't flood the logs
+            # Prevent logging identical re-taps if no cash was added
             if amount_added <= 0:
                 conn.close()
-                return {"success": True, "message": "Balance unchanged or matches cloud data. No log created."}
+                return {"success": True, "message": "Balance unchanged. No log created."}
 
-            # 2. Execute database balance modification update execution
+            # 2. 💰 Update the student's balance profile
             cur.execute(
                 "UPDATE students SET balance = %s WHERE uid = %s;",
                 (req.new_balance, req.uid)
             )
             
-            # 3. 📝 INSERT THE TRANSACTION LOG ENTRY
-            # (Adjust column names like 'student_id', 'amount', 'type', 'reference' to match your exact logs table structure)
+            # 3. 📝 Insert into logs using student_no
+            # NOTE: Double check your 'transactions' table to see if that column 
+            # is also named student_no or student_id, and adjust below if needed!
             cur.execute(
                 """
-                INSERT INTO transactions (student_id, amount, transaction_type, reference_device, current_balance) 
+                INSERT INTO transactions (student_no, amount, transaction_type, reference_device, current_balance) 
                 VALUES (%s, %s, %s, %s, %s);
                 """,
-                (student_id, amount_added, 'TOPUP', 'KIOSK_TERMINAL', req.new_balance)
+                (student_no, amount_added, 'TOPUP', 'KIOSK_TERMINAL', req.new_balance)
             )
             
             conn.commit()
@@ -185,6 +186,9 @@ def sync_kiosk_topup(req: TopUpRequest):
             "message": f"Cloud balance updated smoothly to PHP {req.new_balance} and logged successfully."
         }
     except Exception as e:
-        if conn:
+        # Safeguard close to prevent thread dangling on errors
+        try:
             conn.close()
+        except:
+            pass
         return {"success": False, "error_details": str(e)}
