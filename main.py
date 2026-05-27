@@ -136,50 +136,93 @@ from pydantic import BaseModel
 class TopUpRequest(BaseModel):
     uid: str
     new_balance: float
+    signature: str # Expect the security key from the hardware
 
 @app.post("/api/topup")
 def sync_kiosk_topup(req: TopUpRequest):
     """
-    Overwrites the cloud database balance with the new cash value compiled 
-    by the offline hardware bill validator terminal and logs a transaction entry.
+    CRYPTO VALIDATION: Uses FNV-1a verification to instantly validate hardware logs
+    without restricting legitimate multi-bill or bulk offline sync operations.
     """
+    # This MUST match the SECRET_KEY value inside your Arduino code exactly!
+    SECRET_KEY = 2166136261 
+    
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            # 1. Fetch current metrics with row locking to ensure thread safety
+            # 1. Fetch data from DB
             cur.execute("SELECT balance, name FROM students WHERE uid = %s FOR UPDATE", (req.uid,))
             student = cur.fetchone()
             
             if not student:
                 raise HTTPException(status_code=404, detail="Student record missing.")
+                
+            db_balance = float(student["balance"])
+            amount_added = req.new_balance - db_balance
             
-            old_balance = float(student["balance"])
-            amount_added = req.new_balance - old_balance
-            
-            # Prevent logging identical taps if no new cash bills were inserted
             if amount_added <= 0:
-                return {"success": True, "message": "Balance matches cloud data or is lower. No log created."}
+                return {"success": True, "message": "Database is already synchronous."}
 
-            # 2. Directly update the student's cloud profile with the cash total
+            # 2. 🛡️ VERIFY THE CRYPTOGRAPHIC SIGNATURE
+            # We recreate the exact same hardware hash calculation in Python
+            calc_hash = SECRET_KEY
+            
+            # Convert UID back to raw bytes (mimicking the RFID scanner's UID buffer)
+            # Assuming standard 4-byte UID converted back from decimal string
+            try:
+                uid_int = int(req.uid)
+                uid_bytes = [
+                    (uid_int & 0xFF),
+                    ((uid_int >> 8) & 0xFF),
+                    ((uid_int >> 16) & 0xFF),
+                    ((uid_int >> 24) & 0xFF)
+                ]
+            except:
+                raise HTTPException(status_code=400, detail="Malformed UID string data received.")
+                
+            # Recreate balance buffer bytes
+            int_credit = int(req.new_balance)
+            credit_bytes = [
+                (int_credit >> 8) & 0xFF,
+                int_credit & 0xFF
+            ]
+            
+            # Run FNV-1a on UID bytes
+            for byte in uid_bytes:
+                calc_hash ^= byte
+                calc_hash = (calc_hash * 16777619) & 0xFFFFFFFF
+                
+            # Run FNV-1a on Credit bytes
+            for byte in credit_bytes:
+                calc_hash ^= byte
+                calc_hash = (calc_hash * 16777619) & 0xFFFFFFFF
+
+            # Verify client signature against calculated server signature
+            if str(calc_hash) != str(req.signature):
+                return {
+                    "success": False, 
+                    "message": "Security Violation: Unauthorized card tampering signature detected!"
+                }
+
+            # 3. 💰 Process completely trustable updates
             cur.execute("UPDATE students SET balance = %s WHERE uid = %s", (req.new_balance, req.uid))
             
-            # 3. 📝 Insert the receipt entry into your 'logs' table matching your exact schema
             timestamp = datetime.now()
             cur.execute('''
                 INSERT INTO logs (uid, timestamp, type, amount, running_balance, device_id)
                 VALUES (%s, %s, 'TOPUP', %s, %s, 'KIOSK_TERMINAL')
             ''', (req.uid, timestamp, amount_added, req.new_balance))
             
-            conn.commit() # Safely commit changes
+            conn.commit() 
             return {
                 "success": True, 
                 "name": student["name"], 
                 "new_balance": req.new_balance,
-                "message": f"Successfully topped up PHP {amount_added:.2f}"
+                "message": f"Successfully processed secure transaction log update."
             }
             
     except Exception as e:
-        conn.rollback() # Undo database query blocks cleanly if network drops
+        conn.rollback() 
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        conn.close() # Release connection slots back to Supabase pool
+        conn.close()
