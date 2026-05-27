@@ -2,7 +2,8 @@
   "builds": [
     {
       "src": "main.py",
-      "use": "@now/python"
+      "use": "@vercel/python",
+      "config": { "runtime": "python3.12" }
     }
   ],
   "routes": [
