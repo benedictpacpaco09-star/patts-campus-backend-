@@ -33,32 +33,87 @@ class TransactionRequest(BaseModel):
 
 # --- ENDPOINTS ---
 
+from fastapi import FastAPI, HTTPException, Query
+from datetime import datetime
+
 @app.get("/api/scan/{uid}")
-def scan_card(uid: str):
-    """Instant balance/status lookups for the ESP32 terminal."""
+def scan_card(
+    uid: str, 
+    card_bal: int = Query(None), 
+    sig: str = Query(None)
+):
+    SECRET_KEY = 2166136261
     conn = get_db_connection()
+    
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT uid, name, student_no, balance, status FROM students WHERE uid = %s", (uid,))
+            # Fetch the current stale database entry
+            cur.execute("SELECT balance, name FROM students WHERE uid = %s FOR UPDATE", (uid,))
             student = cur.fetchone()
             
             if not student:
-                return {"status": "NOT_FOUND", "message": "Card not registered."}
-            
-            if student["status"] == 1:
-                return {"status": "LOCKED", "name": student["name"], "message": "Card suspended."}
-            elif student["status"] == 2:
-                return {"status": "STOLEN", "name": student["name"], "message": "Card flagged stolen."}
+                raise HTTPException(status_code=404, detail="Student profile not found.")
                 
+            db_balance = int(student["balance"])
+
+            # 🔄 AUTOMATIC OFFLINE SYNC DISCOVERY LAYER
+            if card_bal is not None and sig is not None:
+                # If the card holds more money than the database, verify it!
+                if card_bal > db_balance:
+                    
+                    # Recreate the FNV-1a hardware validation signature locally in Python
+                    try:
+                        uid_int = int(uid)
+                        uid_bytes = [
+                            (uid_int & 0xFF),
+                            ((uid_int >> 8) & 0xFF),
+                            ((uid_int >> 16) & 0xFF),
+                            ((uid_int >> 24) & 0xFF)
+                        ]
+                    except:
+                        raise HTTPException(status_code=400, detail="Malformed UID format.")
+                        
+                    credit_bytes = [
+                        (card_bal >> 8) & 0xFF,
+                        card_bal & 0xFF
+                    ]
+                    
+                    calc_hash = SECRET_KEY
+                    for byte in uid_bytes:
+                        calc_hash ^= byte
+                        calc_hash = (calc_hash * 16777619) & 0xFFFFFFFF
+                    for byte in credit_bytes:
+                        calc_hash ^= byte
+                        calc_hash = (calc_hash * 16777619) & 0xFFFFFFFF
+
+                    # Security Verification Check
+                    if str(calc_hash) == str(sig):
+                        amount_added = card_bal - db_balance
+                        
+                        # Apply local changes directly to the persistent cloud storage layer
+                        cur.execute("UPDATE students SET balance = %s WHERE uid = %s", (card_bal, uid))
+                        
+                        # Log it as an offline reconciliation transaction
+                        cur.execute('''
+                            INSERT INTO logs (uid, timestamp, type, amount, running_balance, device_id)
+                            VALUES (%s, %s, 'OFFLINE_SYNC', %s, %s, 'KIOSK_TERMINAL')
+                        ''', (uid, datetime.now(), amount_added, card_bal))
+                        
+                        conn.commit()
+                        db_balance = card_bal # Match output to reconciled value
+                        print(f"[RECONCILED] Student {uid} successfully sync'd offline load of PHP {amount_added}")
+
             return {
-                "status": "ACTIVE",
-                "uid": student["uid"],
+                "success": True,
                 "name": student["name"],
-                "student_no": student["student_no"],
-                "balance": float(student["balance"])
+                "balance": db_balance
             }
+            
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
-        conn.close() # CRUCIAL: Closes socket immediately so Supabase doesn't choke
+        conn.close()
 
 @app.post("/api/deduct")
 def deduct_funds(req: TransactionRequest):
